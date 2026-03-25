@@ -2,3 +2,11 @@ node_modules/
 dist/
 *.log
 config.json
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab

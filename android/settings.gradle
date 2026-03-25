@@ -1,0 +1,2 @@
+rootProject.name = 'Sharkord'
+include ':app'
