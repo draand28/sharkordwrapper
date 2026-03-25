@@ -1,0 +1,36 @@
+{
+  "name": "sharkord",
+  "version": "1.0.0",
+  "description": "Windows desktop wrapper for Sharkord",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "pack": "electron-builder --win --dir"
+  },
+  "author": "draand28",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "dependencies": {
+    "auto-launch": "^5.0.6"
+  },
+  "build": {
+    "appId": "com.sharkord.desktop",
+    "productName": "Sharkord",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false
+    }
+  }
+}

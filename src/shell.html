@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sharkord</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
+    /* ── Custom Titlebar ─────────────────────────────────────── */
+    #titlebar {
+      display: flex;
+      align-items: center;
+      height: 32px;
+      background: #0f0f23;
+      -webkit-app-region: drag;
+      user-select: none;
+      flex-shrink: 0;
+      z-index: 1000;
+    }
+
+    #titlebar-icon {
+      width: 16px;
+      height: 16px;
+      margin: 0 8px 0 10px;
+      -webkit-app-region: no-drag;
+    }
+
+    #titlebar-title {
+      color: #8888aa;
+      font-size: 12px;
+      font-weight: 500;
+      flex: 1;
+    }
+
+    .titlebar-btn {
+      -webkit-app-region: no-drag;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 46px;
+      height: 32px;
+      border: none;
+      background: transparent;
+      color: #8888aa;
+      font-size: 11px;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .titlebar-btn:hover {
+      background: rgba(255,255,255,0.08);
+      color: #ffffff;
+    }
+
+    .titlebar-btn.close:hover {
+      background: #e81123;
+      color: #ffffff;
+    }
+
+    .titlebar-btn svg {
+      width: 12px;
+      height: 12px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+    }
+
+    /* ── Setup screen ─────────────────────────────────────────── */
+    #setup {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      flex: 1;
+      color: #ccccdd;
+      gap: 20px;
+    }
+
+    #setup.hidden { display: none; }
+
+    #setup h1 {
+      font-size: 28px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    #setup p {
+      font-size: 14px;
+      color: #8888aa;
+      max-width: 400px;
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    #setup input {
+      width: 360px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      border: 1px solid #333355;
+      background: #16162b;
+      color: #ffffff;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    #setup input:focus {
+      border-color: #5865f2;
+    }
+
+    #setup button {
+      padding: 10px 32px;
+      border-radius: 6px;
+      border: none;
+      background: #5865f2;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    #setup button:hover {
+      background: #4752c4;
+    }
+
+    #error-msg {
+      color: #f04747;
+      font-size: 13px;
+      min-height: 18px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Custom Titlebar -->
+  <div id="titlebar">
+    <svg id="titlebar-icon" viewBox="0 0 16 16" fill="#5865f2">
+      <circle cx="8" cy="8" r="7"/>
+    </svg>
+    <span id="titlebar-title">Sharkord</span>
+    <button class="titlebar-btn" id="btn-minimize" title="Minimize">
+      <svg viewBox="0 0 12 12"><line x1="1" y1="6" x2="11" y2="6"/></svg>
+    </button>
+    <button class="titlebar-btn" id="btn-maximize" title="Maximize">
+      <svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="1"/></svg>
+    </button>
+    <button class="titlebar-btn close" id="btn-close" title="Close">
+      <svg viewBox="0 0 12 12"><line x1="2" y1="2" x2="10" y2="10"/><line x1="10" y1="2" x2="2" y2="10"/></svg>
+    </button>
+  </div>
+
+  <!-- Setup screen (visible until connected, then the BrowserView takes over the space below the titlebar) -->
+  <div id="setup">
+    <h1>Sharkord</h1>
+    <p>Enter the URL of your Sharkord instance to get started.</p>
+    <input type="url" id="url-input" placeholder="http://localhost:3000" autocomplete="off" spellcheck="false"/>
+    <span id="error-msg"></span>
+    <button id="connect-btn">Connect</button>
+  </div>
+
+  <script>
+    const { minimize, maximize, close, getConfig, connectUrl } = window.sharkord;
+
+    // Titlebar buttons
+    document.getElementById('btn-minimize').addEventListener('click', minimize);
+    document.getElementById('btn-maximize').addEventListener('click', maximize);
+    document.getElementById('btn-close').addEventListener('click', close);
+
+    const setupEl = document.getElementById('setup');
+    const input = document.getElementById('url-input');
+    const btn = document.getElementById('connect-btn');
+    const errMsg = document.getElementById('error-msg');
+
+    // Init: if a URL is already saved (and not the default), connect immediately
+    (async () => {
+      const config = await getConfig();
+      input.value = config.url || 'http://localhost:3000';
+
+      if (config.url && config.url !== 'http://localhost:3000') {
+        await doConnect(config.url);
+      }
+    })();
+
+    btn.addEventListener('click', () => handleConnect());
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleConnect();
+    });
+
+    async function handleConnect() {
+      const url = input.value.trim();
+      if (!url) {
+        errMsg.textContent = 'Please enter a URL.';
+        return;
+      }
+      try { new URL(url); } catch {
+        errMsg.textContent = 'Please enter a valid URL.';
+        return;
+      }
+      errMsg.textContent = '';
+      btn.disabled = true;
+      btn.textContent = 'Connecting...';
+      await doConnect(url);
+    }
+
+    async function doConnect(url) {
+      await connectUrl(url);
+      // Hide setup — the BrowserView now occupies the space below the titlebar
+      setupEl.classList.add('hidden');
+    }
+  </script>
+
+</body>
+</html>
