@@ -1,11 +1,13 @@
 package com.sharkord.app;
 
 import android.Manifest;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
@@ -13,10 +15,6 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.webkit.ValueCallback;
-import android.content.Intent;
-import android.view.View;
-import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -33,12 +31,12 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_URL = "sharkord_url";
 
     private WebView webView;
+    private boolean serviceRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Full-screen immersive mode with status bar color
         getWindow().setStatusBarColor(0xFF0F0F23);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
@@ -51,6 +49,7 @@ public class MainActivity extends AppCompatActivity {
         String savedUrl = getPrefs().getString(KEY_URL, null);
         if (savedUrl != null && !savedUrl.isEmpty()) {
             webView.loadUrl(savedUrl);
+            startKeepAliveService();
         } else {
             webView.loadUrl("file:///android_asset/setup.html");
         }
@@ -58,6 +57,23 @@ public class MainActivity extends AppCompatActivity {
 
     private SharedPreferences getPrefs() {
         return getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+    }
+
+    private void startKeepAliveService() {
+        if (serviceRunning) return;
+        Intent serviceIntent = new Intent(this, KeepAliveService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
+        serviceRunning = true;
+    }
+
+    private void stopKeepAliveService() {
+        if (!serviceRunning) return;
+        stopService(new Intent(this, KeepAliveService.class));
+        serviceRunning = false;
     }
 
     private void setupWebView() {
@@ -72,20 +88,16 @@ public class MainActivity extends AppCompatActivity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setUserAgentString(settings.getUserAgentString() + " SharkordAndroid/1.0");
 
-        // Enable cookies
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
-        // JavaScript interface for setup page to save URL
         webView.addJavascriptInterface(new SetupBridge(), "SharkordBridge");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                String url = request.getUrl().toString();
                 String savedUrl = getPrefs().getString(KEY_URL, "");
 
-                // Keep same-origin navigation in the WebView
                 if (!savedUrl.isEmpty()) {
                     try {
                         Uri savedUri = Uri.parse(savedUrl);
@@ -96,7 +108,6 @@ public class MainActivity extends AppCompatActivity {
                     } catch (Exception ignored) {}
                 }
 
-                // Open external links in browser
                 Intent intent = new Intent(Intent.ACTION_VIEW, request.getUrl());
                 startActivity(intent);
                 return true;
@@ -154,16 +165,24 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onPause() {
-        webView.onPause();
+        // Do NOT call webView.onPause() — it suspends WebRTC
         super.onPause();
     }
 
-    // Bridge for the setup page to save the URL and navigate
+    @Override
+    protected void onDestroy() {
+        stopKeepAliveService();
+        super.onDestroy();
+    }
+
     public class SetupBridge {
         @android.webkit.JavascriptInterface
         public void connect(String url) {
             getPrefs().edit().putString(KEY_URL, url).apply();
-            runOnUiThread(() -> webView.loadUrl(url));
+            runOnUiThread(() -> {
+                webView.loadUrl(url);
+                startKeepAliveService();
+            });
         }
 
         @android.webkit.JavascriptInterface
