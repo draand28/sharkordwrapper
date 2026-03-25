@@ -43,8 +43,6 @@ function syncAutoLaunch() {
 // ── Globals ─────────────────────────────────────────────────────────────────
 let mainWindow = null;
 let tray = null;
-let isOnSetupPage = true;
-const TITLEBAR_HEIGHT = 32;
 
 function getIcon() {
   const iconPath = path.join(__dirname, '..', 'assets', 'icon.png');
@@ -54,97 +52,54 @@ function getIcon() {
   return nativeImage.createEmpty();
 }
 
-// ── Titlebar CSS + HTML injected into Sharkord pages ────────────────────────
-const TITLEBAR_CSS = `
-  #sharkord-titlebar {
-    position: fixed;
-    top: 0; left: 0; right: 0;
-    height: ${TITLEBAR_HEIGHT}px;
-    background: #0f0f23;
-    display: flex;
-    align-items: center;
-    z-index: 2147483647;
-    -webkit-app-region: drag;
-    user-select: none;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  }
-  #sharkord-titlebar .tb-icon {
-    width: 16px; height: 16px;
-    margin: 0 8px 0 10px;
-  }
-  #sharkord-titlebar .tb-title {
-    color: #8888aa;
-    font-size: 12px;
-    font-weight: 500;
-    flex: 1;
-  }
-  #sharkord-titlebar .tb-btn {
-    -webkit-app-region: no-drag;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 46px;
-    height: ${TITLEBAR_HEIGHT}px;
-    border: none;
-    background: transparent;
-    color: #8888aa;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  #sharkord-titlebar .tb-btn:hover {
-    background: rgba(255,255,255,0.08);
-    color: #ffffff;
-  }
-  #sharkord-titlebar .tb-btn.tb-close:hover {
-    background: #e81123;
-    color: #ffffff;
-  }
-  #sharkord-titlebar .tb-btn svg {
-    width: 12px; height: 12px;
-    stroke: currentColor;
-    fill: none;
-    stroke-width: 1.5;
-  }
-  /* Push page content below the titlebar */
-  body {
-    margin-top: ${TITLEBAR_HEIGHT}px !important;
-  }
-`;
-
-const TITLEBAR_HTML = `
-  <div id="sharkord-titlebar">
-    <svg class="tb-icon" viewBox="0 0 16 16" fill="#5865f2"><circle cx="8" cy="8" r="7"/></svg>
-    <span class="tb-title">Sharkord</span>
-    <button class="tb-btn" id="tb-min" title="Minimize">
-      <svg viewBox="0 0 12 12"><line x1="1" y1="6" x2="11" y2="6"/></svg>
-    </button>
-    <button class="tb-btn" id="tb-max" title="Maximize">
-      <svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="1"/></svg>
-    </button>
-    <button class="tb-btn tb-close" id="tb-close" title="Close">
-      <svg viewBox="0 0 12 12"><line x1="2" y1="2" x2="10" y2="10"/><line x1="10" y1="2" x2="2" y2="10"/></svg>
-    </button>
-  </div>
-`;
-
-const TITLEBAR_JS = `
-  (function() {
-    if (document.getElementById('sharkord-titlebar')) return;
-    const div = document.createElement('div');
-    div.innerHTML = ${JSON.stringify(TITLEBAR_HTML)};
-    document.body.prepend(div.firstElementChild);
-
-    document.getElementById('tb-min').addEventListener('click', () => {
-      window.__sharkordTitlebar.minimize();
+// ── Screen Picker ───────────────────────────────────────────────────────────
+function showScreenPicker(sources) {
+  return new Promise((resolve) => {
+    const pickerWindow = new BrowserWindow({
+      width: 680,
+      height: 520,
+      parent: mainWindow,
+      modal: true,
+      frame: false,
+      resizable: false,
+      skipTaskbar: true,
+      backgroundColor: '#1a1a2e',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: path.join(__dirname, 'picker-preload.js'),
+      },
     });
-    document.getElementById('tb-max').addEventListener('click', () => {
-      window.__sharkordTitlebar.maximize();
+
+    const sourceData = sources.map(s => ({
+      id: s.id,
+      name: s.name,
+      thumbnail: s.thumbnail.toDataURL(),
+    }));
+
+    ipcMain.once('picker:select', (_, sourceId) => {
+      pickerWindow.close();
+      const selected = sources.find(s => s.id === sourceId);
+      resolve(selected || null);
     });
-    document.getElementById('tb-close').addEventListener('click', () => {
-      window.__sharkordTitlebar.close();
+
+    ipcMain.once('picker:cancel', () => {
+      pickerWindow.close();
+      resolve(null);
     });
-  })();
-`;
+
+    pickerWindow.on('closed', () => {
+      ipcMain.removeAllListeners('picker:select');
+      ipcMain.removeAllListeners('picker:cancel');
+      resolve(null);
+    });
+
+    pickerWindow.loadFile(path.join(__dirname, 'picker.html'));
+    pickerWindow.webContents.on('did-finish-load', () => {
+      pickerWindow.webContents.send('picker:sources', sourceData);
+    });
+  });
+}
 
 // ── Permissions ─────────────────────────────────────────────────────────────
 function setupPermissions() {
@@ -170,16 +125,22 @@ function setupPermissions() {
     return allowedPermissions.includes(permission);
   });
 
-  // Screen sharing: provide screen sources for getDisplayMedia()
   ses.setDisplayMediaRequestHandler((request, callback) => {
-    desktopCapturer.getSources({ types: ['screen', 'window'] }).then((sources) => {
+    desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 320, height: 180 },
+    }).then((sources) => {
       if (sources.length === 0) {
         callback({});
         return;
       }
-      const screenSource = sources.find(s => s.id.startsWith('screen:')) || sources[0];
-      // Only pass video — do NOT pass audio to avoid SDP codec collisions
-      callback({ video: screenSource });
+      showScreenPicker(sources).then((selected) => {
+        if (selected) {
+          callback({ video: selected });
+        } else {
+          callback({});
+        }
+      });
     }).catch(() => {
       callback({});
     });
@@ -193,7 +154,12 @@ function createWindow() {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    frame: false,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#0f0f23',
+      symbolColor: '#8888aa',
+      height: 32,
+    },
     icon: getIcon(),
     backgroundColor: '#1a1a2e',
     webPreferences: {
@@ -203,11 +169,9 @@ function createWindow() {
     },
   });
 
-  // Start with setup page or go straight to Sharkord
   if (config.url && config.url !== DEFAULT_URL) {
     navigateToSharkord(config.url);
   } else {
-    isOnSetupPage = true;
     mainWindow.loadFile(path.join(__dirname, 'shell.html'));
   }
 
@@ -223,16 +187,35 @@ function createWindow() {
   });
 }
 
+function injectDragRegion() {
+  if (!mainWindow) return;
+  // Inject a transparent drag strip at the top — no layout changes, just enables dragging.
+  // Covers the left side only (right side has native overlay buttons).
+  mainWindow.webContents.insertCSS(`
+    #sharkord-drag {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 138px;
+      height: 32px;
+      -webkit-app-region: drag;
+      z-index: 2147483647;
+    }
+  `).catch(() => {});
+  mainWindow.webContents.executeJavaScript(`
+    if (!document.getElementById('sharkord-drag')) {
+      const d = document.createElement('div');
+      d.id = 'sharkord-drag';
+      document.body.prepend(d);
+    }
+  `).catch(() => {});
+}
+
 function navigateToSharkord(url) {
-  isOnSetupPage = false;
   mainWindow.loadURL(url);
 
-  // Inject titlebar once the page finishes loading
-  mainWindow.webContents.on('did-finish-load', injectTitlebar);
-  // Also on in-page navigations
-  mainWindow.webContents.on('did-navigate-in-page', injectTitlebar);
+  mainWindow.webContents.on('did-finish-load', injectDragRegion);
 
-  // Open external links in default browser
   mainWindow.webContents.setWindowOpenHandler(({ url: linkUrl }) => {
     try {
       const target = new URL(linkUrl);
@@ -244,12 +227,6 @@ function navigateToSharkord(url) {
     } catch {}
     return { action: 'allow' };
   });
-}
-
-function injectTitlebar() {
-  if (!mainWindow || isOnSetupPage) return;
-  mainWindow.webContents.insertCSS(TITLEBAR_CSS).catch(() => {});
-  mainWindow.webContents.executeJavaScript(TITLEBAR_JS).catch(() => {});
 }
 
 // ── Tray ────────────────────────────────────────────────────────────────────
@@ -346,7 +323,6 @@ ipcMain.on('window:check-maximized', (event) => {
 
 // ── App lifecycle ───────────────────────────────────────────────────────────
 app.on('ready', () => {
-  // Request OS-level media access on Windows
   if (process.platform === 'win32') {
     try {
       if (systemPreferences.getMediaAccessStatus('camera') !== 'granted') {
