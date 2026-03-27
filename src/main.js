@@ -104,15 +104,15 @@ function showScreenPicker(sources) {
 }
 
 // ── Audio loopback ──────────────────────────────────────────────────────────
+// Returns empty string on success, or error message on failure
 function startLoopbackCapture() {
-  if (loopbackActive) return true;
+  if (loopbackActive) return '';
   if (!audioLoopback.isSupported()) {
-    console.warn('[Main] Native audio loopback not supported on this OS version');
-    return false;
+    return 'OS not supported (need Windows 10 2004+)';
   }
 
   let frameCount = 0;
-  const started = audioLoopback.startCapture(process.pid, (buffer, channels, sampleRate) => {
+  const error = audioLoopback.startCapture(process.pid, (buffer, channels, sampleRate) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       frameCount++;
       if (frameCount === 1) {
@@ -122,13 +122,15 @@ function startLoopbackCapture() {
     }
   });
 
-  if (started) {
-    console.log('[Main] Native loopback capture started successfully');
-  } else {
-    console.warn('[Main] Native loopback capture failed to start');
+  if (error) {
+    console.warn('[Main] Native loopback capture failed:', error);
+    loopbackActive = false;
+    return error;
   }
-  loopbackActive = started;
-  return started;
+
+  console.log('[Main] Native loopback capture started successfully');
+  loopbackActive = true;
+  return '';
 }
 
 function stopLoopbackCapture() {
@@ -183,27 +185,19 @@ function setupPermissions() {
       showScreenPicker(sources).then((result) => {
         if (result) {
           if (result.audio) {
-            const supported = audioLoopback.isSupported();
-            mainWindow.webContents.executeJavaScript(
-              `console.log('[Sharkord] Native addon supported: ${supported}')`
-            ).catch(() => {});
-
-            if (supported) {
-              const started = startLoopbackCapture();
+            const error = startLoopbackCapture();
+            // Log result to DevTools console
+            if (!error) {
               mainWindow.webContents.executeJavaScript(
-                `console.log('[Sharkord] Native capture started: ${started}')`
+                `console.log('[Sharkord] Native process-exclusive loopback started (PID ${process.pid} excluded)')`
               ).catch(() => {});
-
-              if (started) {
-                callback({ video: result.source });
-                return;
-              }
+              callback({ video: result.source });
+            } else {
+              mainWindow.webContents.executeJavaScript(
+                `console.warn('[Sharkord] Native loopback failed: ' + ${JSON.stringify(error)} + ' — falling back to regular loopback (with echo)')`
+              ).catch(() => {});
+              callback({ video: result.source, audio: 'loopback' });
             }
-            console.warn('[Main] Falling back to regular loopback');
-            mainWindow.webContents.executeJavaScript(
-              `console.warn('[Sharkord] Falling back to regular loopback (with echo)')`
-            ).catch(() => {});
-            callback({ video: result.source, audio: 'loopback' });
           } else {
             callback({ video: result.source });
           }

@@ -81,13 +81,19 @@ LoopbackCapture::~LoopbackCapture() {
     }
 }
 
-bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) {
-    if (m_capturing) return false;
+static std::string hrToString(HRESULT hr) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "0x%08lX", (unsigned long)hr);
+    return std::string(buf);
+}
+
+std::string LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) {
+    if (m_capturing) return "Already capturing";
 
     m_callback = callback;
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool comInitialized = SUCCEEDED(hr) || hr == S_FALSE;
+    // Don't call CoInitializeEx here — Electron's main thread already has COM.
+    // The capture thread will init COM for itself.
 
     // Set up process loopback activation params
     AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
@@ -104,7 +110,7 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
     auto* handler = new ActivationHandler();
     IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
 
-    hr = ActivateAudioInterfaceAsync(
+    HRESULT hr = ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         __uuidof(IAudioClient),
         &activateParams,
@@ -114,16 +120,14 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
 
     if (FAILED(hr)) {
         handler->Release();
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "ActivateAudioInterfaceAsync failed: " + hrToString(hr);
     }
 
     hr = handler->Wait(5000);
     if (FAILED(hr)) {
         handler->Release();
         if (asyncOp) asyncOp->Release();
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "Activation wait failed: " + hrToString(hr);
     }
 
     hr = handler->GetResult(&m_audioClient);
@@ -131,8 +135,7 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
     if (asyncOp) asyncOp->Release();
 
     if (FAILED(hr) || !m_audioClient) {
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "GetResult failed: " + hrToString(hr) + (m_audioClient ? "" : " (null client)");
     }
 
     // Get the mix format
@@ -141,8 +144,7 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
     if (FAILED(hr)) {
         m_audioClient->Release();
         m_audioClient = nullptr;
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "GetMixFormat failed: " + hrToString(hr);
     }
 
     m_sampleRate = pwfx->nSamplesPerSec;
@@ -163,16 +165,14 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
     if (FAILED(hr)) {
         m_audioClient->Release();
         m_audioClient = nullptr;
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "Initialize failed: " + hrToString(hr);
     }
 
     hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_captureClient);
     if (FAILED(hr)) {
         m_audioClient->Release();
         m_audioClient = nullptr;
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "GetService(CaptureClient) failed: " + hrToString(hr);
     }
 
     ResetEvent(m_stopEvent);
@@ -185,12 +185,11 @@ bool LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback callback) 
         m_audioClient->Release();
         m_audioClient = nullptr;
         m_capturing = false;
-        if (comInitialized) CoUninitialize();
-        return false;
+        return "AudioClient Start failed: " + hrToString(hr);
     }
 
     m_thread = std::thread(&LoopbackCapture::CaptureThread, this);
-    return true;
+    return ""; // success
 }
 
 void LoopbackCapture::Stop() {

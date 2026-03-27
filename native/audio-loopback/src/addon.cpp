@@ -36,12 +36,11 @@ Napi::Value StartCapture(const Napi::CallbackInfo& info) {
 
     g_capture = std::make_unique<LoopbackCapture>();
 
-    bool started = g_capture->Start(processId,
+    std::string error = g_capture->Start(processId,
         [](const float* data, uint32_t frameCount, uint32_t channels, uint32_t sampleRate) {
             if (!g_tsfn) return;
 
             uint32_t totalSamples = frameCount * channels;
-            // Copy data since the buffer is only valid during this callback
             auto* dataCopy = new float[totalSamples];
             memcpy(dataCopy, data, totalSamples * sizeof(float));
 
@@ -74,10 +73,11 @@ Napi::Value StartCapture(const Napi::CallbackInfo& info) {
         }
     );
 
-    if (!started) {
+    if (!error.empty()) {
         g_capture.reset();
         g_tsfn.Release();
-        return Napi::Boolean::New(env, false);
+        // Return the error string instead of false so JS can log it
+        return Napi::String::New(env, error);
     }
 
     return Napi::Boolean::New(env, true);

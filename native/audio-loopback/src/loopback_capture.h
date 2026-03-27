@@ -6,6 +6,7 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <atomic>
 #include <functional>
+#include <string>
 #include <thread>
 
 // Available since Windows 10 2004 (build 19041)
@@ -64,7 +65,8 @@ public:
     LoopbackCapture();
     ~LoopbackCapture();
 
-    bool Start(DWORD excludeProcessId, AudioDataCallback callback);
+    // Returns empty string on success, or error description on failure
+    std::string Start(DWORD excludeProcessId, AudioDataCallback callback);
     void Stop();
     bool IsCapturing() const;
 

@@ -48,13 +48,17 @@ function isCapturing() {
 function startCapture(excludeProcessId, onData) {
   const a = getAddon();
   if (!a) {
-    console.warn('[AudioLoopback] Cannot start capture: addon not loaded');
-    return false;
+    return 'addon not loaded';
   }
   console.log('[AudioLoopback] Starting capture, excluding PID:', excludeProcessId);
   const result = a.startCapture(excludeProcessId, onData);
-  console.log('[AudioLoopback] Capture started:', result);
-  return result;
+  if (result === true) {
+    console.log('[AudioLoopback] Capture started successfully');
+    return '';
+  }
+  // result is an error string
+  console.warn('[AudioLoopback] Capture failed:', result);
+  return typeof result === 'string' ? result : 'unknown error';
 }
 
 function stopCapture() {
