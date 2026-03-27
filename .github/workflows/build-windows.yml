@@ -25,8 +25,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build native audio loopback addon
+        run: npm run build:native
+
       - name: Build Windows installer
-        run: npm run build
+        run: npx electron-builder --win --publish never
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4

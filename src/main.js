@@ -6,6 +6,7 @@ const {
 const path = require('path');
 const AutoLaunch = require('auto-launch');
 const fs = require('fs');
+const audioLoopback = require('./audio-loopback-bridge');
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
@@ -43,6 +44,7 @@ function syncAutoLaunch() {
 // ── Globals ─────────────────────────────────────────────────────────────────
 let mainWindow = null;
 let tray = null;
+let loopbackActive = false;
 
 function getIcon() {
   const iconPath = path.join(__dirname, '..', 'assets', 'icon.png');
@@ -101,6 +103,27 @@ function showScreenPicker(sources) {
   });
 }
 
+// ── Audio loopback ──────────────────────────────────────────────────────────
+function startLoopbackCapture() {
+  if (loopbackActive) return true;
+  if (!audioLoopback.isSupported()) return false;
+
+  const started = audioLoopback.startCapture(process.pid, (buffer, channels, sampleRate) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('audio-loopback:data', Array.from(buffer), channels, sampleRate);
+    }
+  });
+
+  loopbackActive = started;
+  return started;
+}
+
+function stopLoopbackCapture() {
+  if (!loopbackActive) return;
+  audioLoopback.stopCapture();
+  loopbackActive = false;
+}
+
 // ── Permissions ─────────────────────────────────────────────────────────────
 function setupPermissions() {
   const ses = session.defaultSession;
@@ -136,9 +159,22 @@ function setupPermissions() {
       }
       showScreenPicker(sources).then((result) => {
         if (result) {
-          const opts = { video: result.source };
-          if (result.audio) opts.audio = 'loopback';
-          callback(opts);
+          if (result.audio && audioLoopback.isSupported()) {
+            // Use native process-exclusive loopback (excludes our own audio)
+            const started = startLoopbackCapture();
+            if (started) {
+              // Video only from Electron — audio injected via AudioWorklet
+              callback({ video: result.source });
+            } else {
+              // Fallback to system loopback if native addon fails
+              callback({ video: result.source, audio: 'loopback' });
+            }
+          } else if (result.audio) {
+            // Native addon not supported, fall back to regular loopback
+            callback({ video: result.source, audio: 'loopback' });
+          } else {
+            callback({ video: result.source });
+          }
         } else {
           callback({});
         }
@@ -185,6 +221,7 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    stopLoopbackCapture();
     mainWindow = null;
   });
 }
@@ -213,10 +250,157 @@ function injectDragRegion() {
   `).catch(() => {});
 }
 
+// AudioWorklet injection script — monkey-patches getDisplayMedia to add
+// process-exclusive loopback audio track when native capture is active.
+const AUDIO_INJECT_SCRIPT = `
+(function() {
+  if (window.__sharkordAudioInjected) return;
+  window.__sharkordAudioInjected = true;
+
+  const originalGDM = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+
+  navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+    const stream = await originalGDM(constraints);
+
+    // Check if native loopback is feeding us data
+    if (!window.__sharkordAudio) return stream;
+
+    // Wait briefly to see if we receive audio data (indicates native capture is active)
+    const hasNativeAudio = await new Promise((resolve) => {
+      let received = false;
+      const handler = () => { received = true; };
+      window.__sharkordAudio.onData(handler);
+      setTimeout(() => {
+        window.__sharkordAudio.removeData(handler);
+        resolve(received);
+      }, 200);
+    });
+
+    if (!hasNativeAudio) return stream;
+
+    // Create AudioContext and worklet to convert PCM data into a MediaStreamTrack
+    const audioCtx = new AudioContext({ sampleRate: 48000 });
+
+    // Register the processor inline via Blob URL
+    const processorCode = \`
+      class LoopbackProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.buffer = [];
+          this.port.onmessage = (e) => {
+            // e.data = { samples: Float32Array, channels: number }
+            const { samples, channels } = e.data;
+            // Deinterleave into per-channel arrays
+            const framesPerChannel = samples.length / channels;
+            const frame = [];
+            for (let ch = 0; ch < channels; ch++) {
+              const chData = new Float32Array(framesPerChannel);
+              for (let i = 0; i < framesPerChannel; i++) {
+                chData[i] = samples[i * channels + ch];
+              }
+              frame.push(chData);
+            }
+            this.buffer.push(...frame.map((chData, ch) => ({ ch, data: chData })));
+          };
+        }
+
+        process(inputs, outputs) {
+          const output = outputs[0];
+          if (!output || output.length === 0) return true;
+
+          const numChannels = output.length;
+          const frameSize = output[0].length;
+
+          // Collect enough buffered data per channel
+          for (let ch = 0; ch < numChannels; ch++) {
+            let written = 0;
+            while (written < frameSize) {
+              // Find next buffer entry for this channel
+              const idx = this.buffer.findIndex(b => b.ch === ch);
+              if (idx === -1) {
+                // No data — fill silence
+                output[ch].fill(0, written);
+                break;
+              }
+              const entry = this.buffer[idx];
+              const available = entry.data.length;
+              const needed = frameSize - written;
+              if (available <= needed) {
+                output[ch].set(entry.data, written);
+                written += available;
+                this.buffer.splice(idx, 1);
+              } else {
+                output[ch].set(entry.data.subarray(0, needed), written);
+                entry.data = entry.data.subarray(needed);
+                written += needed;
+              }
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('loopback-processor', LoopbackProcessor);
+    \`;
+
+    const blob = new Blob([processorCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+
+    try {
+      await audioCtx.audioWorklet.addModule(url);
+    } catch (e) {
+      console.warn('[Sharkord] Failed to load AudioWorklet:', e);
+      URL.revokeObjectURL(url);
+      return stream;
+    }
+    URL.revokeObjectURL(url);
+
+    const workletNode = new AudioWorkletNode(audioCtx, 'loopback-processor', {
+      outputChannelCount: [2],
+    });
+    const dest = audioCtx.createMediaStreamDestination();
+    workletNode.connect(dest);
+
+    // Feed PCM data from the native addon into the worklet
+    const dataHandler = (samples, channels, sampleRate) => {
+      workletNode.port.postMessage({
+        samples: new Float32Array(samples),
+        channels: channels,
+      });
+    };
+    window.__sharkordAudio.onData(dataHandler);
+
+    // Add our custom audio track to the display media stream
+    const audioTrack = dest.stream.getAudioTracks()[0];
+    stream.addTrack(audioTrack);
+
+    // Clean up when screen sharing stops
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.addEventListener('ended', () => {
+        window.__sharkordAudio.removeData(dataHandler);
+        window.__sharkordAudio.stop();
+        workletNode.disconnect();
+        audioCtx.close().catch(() => {});
+      });
+    }
+
+    return stream;
+  };
+})();
+`;
+
+function injectAudioWorklet() {
+  if (!mainWindow) return;
+  mainWindow.webContents.executeJavaScript(AUDIO_INJECT_SCRIPT).catch(() => {});
+}
+
 function navigateToSharkord(url) {
   mainWindow.loadURL(url);
 
-  mainWindow.webContents.on('did-finish-load', injectDragRegion);
+  mainWindow.webContents.on('did-finish-load', () => {
+    injectDragRegion();
+    injectAudioWorklet();
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url: linkUrl }) => {
     try {
@@ -323,6 +507,14 @@ ipcMain.on('window:check-maximized', (event) => {
   event.returnValue = mainWindow?.isMaximized() ?? false;
 });
 
+ipcMain.on('audio-loopback:stop', () => {
+  stopLoopbackCapture();
+});
+
+ipcMain.on('audio-loopback:supported', (event) => {
+  event.returnValue = audioLoopback.isSupported();
+});
+
 // ── App lifecycle ───────────────────────────────────────────────────────────
 app.on('ready', () => {
   if (process.platform === 'win32') {
@@ -351,5 +543,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  stopLoopbackCapture();
   app.isQuitting = true;
 });

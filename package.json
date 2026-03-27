@@ -1,21 +1,27 @@
 {
   "name": "sharkord",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Windows desktop wrapper for Sharkord",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win --publish never",
+    "build:native": "cmake-js build -d native/audio-loopback -O native/audio-loopback/build --runtime electron --runtime-version 33.4.11 --arch x64",
+    "build:native:local": "cmake-js build -d native/audio-loopback -O native/audio-loopback/build --runtime electron --runtime-version 33.4.11 --arch x64 -c \"G:/Programs/VisualStudio/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe\"",
+    "rebuild": "electron-rebuild",
+    "build": "npm run build:native && electron-builder --win --publish never",
     "pack": "electron-builder --win --dir"
   },
   "author": "draand28",
   "license": "MIT",
   "devDependencies": {
+    "cmake-js": "^7.3.0",
     "electron": "^33.0.0",
-    "electron-builder": "^25.0.0"
+    "electron-builder": "^25.0.0",
+    "@electron/rebuild": "^3.6.0"
   },
   "dependencies": {
-    "auto-launch": "^5.0.6"
+    "auto-launch": "^5.0.6",
+    "node-addon-api": "^8.0.0"
   },
   "build": {
     "appId": "com.sharkord.desktop",
@@ -25,7 +31,11 @@
     },
     "files": [
       "src/**/*",
-      "assets/**/*"
+      "assets/**/*",
+      "native/**/build/Release/*.node"
+    ],
+    "asarUnpack": [
+      "native/**/build/**/*.node"
     ],
     "win": {
       "target": ["nsis"],
