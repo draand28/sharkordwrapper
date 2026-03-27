@@ -41,6 +41,11 @@ HRESULT ActivationHandler::QueryInterface(REFIID riid, void** ppv) {
         AddRef();
         return S_OK;
     }
+    if (riid == __uuidof(IAgileObject)) {
+        *ppv = static_cast<IAgileObject*>(this);
+        AddRef();
+        return S_OK;
+    }
     *ppv = nullptr;
     return E_NOINTERFACE;
 }

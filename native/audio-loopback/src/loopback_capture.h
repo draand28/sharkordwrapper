@@ -37,7 +37,9 @@ struct AUDIOCLIENT_ACTIVATION_PARAMS {
 // Callback: (float* data, uint32_t frameCount, uint32_t channels, uint32_t sampleRate)
 using AudioDataCallback = std::function<void(const float*, uint32_t, uint32_t, uint32_t)>;
 
-class ActivationHandler : public IActivateAudioInterfaceCompletionHandler {
+// ActivationHandler must implement IAgileObject — ActivateAudioInterfaceAsync
+// returns E_ILLEGAL_METHOD_CALL (0x8000000E) if the handler is not agile.
+class ActivationHandler : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
 public:
     ActivationHandler();
 
