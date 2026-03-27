@@ -182,17 +182,27 @@ function setupPermissions() {
       }
       showScreenPicker(sources).then((result) => {
         if (result) {
-          if (result.audio && audioLoopback.isSupported()) {
-            const started = startLoopbackCapture();
-            if (started) {
-              // Signal renderer that native loopback is active
-              mainWindow.webContents.send('audio-loopback:active', true);
-              callback({ video: result.source });
-              return;
+          if (result.audio) {
+            const supported = audioLoopback.isSupported();
+            mainWindow.webContents.executeJavaScript(
+              `console.log('[Sharkord] Native addon supported: ${supported}')`
+            ).catch(() => {});
+
+            if (supported) {
+              const started = startLoopbackCapture();
+              mainWindow.webContents.executeJavaScript(
+                `console.log('[Sharkord] Native capture started: ${started}')`
+              ).catch(() => {});
+
+              if (started) {
+                callback({ video: result.source });
+                return;
+              }
             }
             console.warn('[Main] Falling back to regular loopback');
-          }
-          if (result.audio) {
+            mainWindow.webContents.executeJavaScript(
+              `console.warn('[Sharkord] Falling back to regular loopback (with echo)')`
+            ).catch(() => {});
             callback({ video: result.source, audio: 'loopback' });
           } else {
             callback({ video: result.source });
@@ -278,26 +288,48 @@ const AUDIO_INJECT_SCRIPT = `
   window.__sharkordAudioInjected = true;
   console.log('[Sharkord] Audio injection script loaded');
 
-  let nativeLoopbackActive = false;
-
-  // Listen for the signal from main process
-  if (window.__sharkordAudio) {
-    window.__sharkordAudio.onActive((active) => {
-      nativeLoopbackActive = active;
-      console.log('[Sharkord] Native loopback active:', active);
-    });
-  }
-
   const originalGDM = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
 
   navigator.mediaDevices.getDisplayMedia = async function(constraints) {
-    console.log('[Sharkord] getDisplayMedia intercepted, nativeLoopbackActive:', nativeLoopbackActive);
+    console.log('[Sharkord] getDisplayMedia intercepted');
     const stream = await originalGDM(constraints);
 
-    if (!nativeLoopbackActive || !window.__sharkordAudio) {
-      console.log('[Sharkord] No native loopback, returning original stream');
+    if (!window.__sharkordAudio) {
+      console.log('[Sharkord] No __sharkordAudio bridge, returning original stream');
       return stream;
     }
+
+    // Check if native loopback is sending data (wait up to 500ms)
+    const hasNativeAudio = await new Promise((resolve) => {
+      let received = false;
+      const handler = () => {
+        if (!received) {
+          received = true;
+          console.log('[Sharkord] Native audio data detected!');
+          resolve(true);
+        }
+      };
+      window.__sharkordAudio.onData(handler);
+      setTimeout(() => {
+        window.__sharkordAudio.removeData(handler);
+        if (!received) {
+          console.log('[Sharkord] No native audio data after 500ms');
+          resolve(false);
+        }
+      }, 500);
+    });
+
+    if (!hasNativeAudio) {
+      console.log('[Sharkord] No native loopback data, returning original stream (may have regular loopback)');
+      return stream;
+    }
+
+    // Remove any existing audio tracks (from regular loopback fallback)
+    stream.getAudioTracks().forEach(t => {
+      console.log('[Sharkord] Removing existing audio track:', t.label);
+      stream.removeTrack(t);
+      t.stop();
+    });
 
     console.log('[Sharkord] Setting up custom audio track from native loopback');
 
