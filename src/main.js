@@ -136,7 +136,7 @@ function setupPermissions() {
       }
       showScreenPicker(sources).then((selected) => {
         if (selected) {
-          callback({ video: selected, audio: 'loopback' });
+          callback({ video: selected, audio: 'loopbackWithMute' });
         } else {
           callback({});
         }
