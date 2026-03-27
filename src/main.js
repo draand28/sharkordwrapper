@@ -106,14 +106,27 @@ function showScreenPicker(sources) {
 // ── Audio loopback ──────────────────────────────────────────────────────────
 function startLoopbackCapture() {
   if (loopbackActive) return true;
-  if (!audioLoopback.isSupported()) return false;
+  if (!audioLoopback.isSupported()) {
+    console.warn('[Main] Native audio loopback not supported on this OS version');
+    return false;
+  }
 
+  let frameCount = 0;
   const started = audioLoopback.startCapture(process.pid, (buffer, channels, sampleRate) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      frameCount++;
+      if (frameCount === 1) {
+        console.log('[Main] First audio frame received:', { channels, sampleRate, bufferLen: buffer.length });
+      }
       mainWindow.webContents.send('audio-loopback:data', Array.from(buffer), channels, sampleRate);
     }
   });
 
+  if (started) {
+    console.log('[Main] Native loopback capture started successfully');
+  } else {
+    console.warn('[Main] Native loopback capture failed to start');
+  }
   loopbackActive = started;
   return started;
 }
@@ -122,6 +135,7 @@ function stopLoopbackCapture() {
   if (!loopbackActive) return;
   audioLoopback.stopCapture();
   loopbackActive = false;
+  console.log('[Main] Native loopback capture stopped');
 }
 
 // ── Permissions ─────────────────────────────────────────────────────────────
@@ -148,6 +162,15 @@ function setupPermissions() {
     return allowedPermissions.includes(permission);
   });
 
+  // Relax CSP so our injected scripts and Blob URLs work
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = details.responseHeaders || {};
+    // Remove CSP that blocks our injected audio worklet
+    delete headers['content-security-policy'];
+    delete headers['Content-Security-Policy'];
+    callback({ responseHeaders: headers });
+  });
+
   ses.setDisplayMediaRequestHandler((request, callback) => {
     desktopCapturer.getSources({
       types: ['screen', 'window'],
@@ -160,17 +183,16 @@ function setupPermissions() {
       showScreenPicker(sources).then((result) => {
         if (result) {
           if (result.audio && audioLoopback.isSupported()) {
-            // Use native process-exclusive loopback (excludes our own audio)
             const started = startLoopbackCapture();
             if (started) {
-              // Video only from Electron — audio injected via AudioWorklet
+              // Signal renderer that native loopback is active
+              mainWindow.webContents.send('audio-loopback:active', true);
               callback({ video: result.source });
-            } else {
-              // Fallback to system loopback if native addon fails
-              callback({ video: result.source, audio: 'loopback' });
+              return;
             }
-          } else if (result.audio) {
-            // Native addon not supported, fall back to regular loopback
+            console.warn('[Main] Falling back to regular loopback');
+          }
+          if (result.audio) {
             callback({ video: result.source, audio: 'loopback' });
           } else {
             callback({ video: result.source });
@@ -228,8 +250,6 @@ function createWindow() {
 
 function injectDragRegion() {
   if (!mainWindow) return;
-  // Inject a transparent drag strip at the top — no layout changes, just enables dragging.
-  // Covers the left side only (right side has native overlay buttons).
   mainWindow.webContents.insertCSS(`
     #sharkord-drag {
       position: fixed;
@@ -250,138 +270,107 @@ function injectDragRegion() {
   `).catch(() => {});
 }
 
-// AudioWorklet injection script — monkey-patches getDisplayMedia to add
-// process-exclusive loopback audio track when native capture is active.
+// Injection script: monkey-patches getDisplayMedia to add process-exclusive
+// loopback audio. Uses ScriptProcessorNode (no Blob URL needed, avoids CSP).
 const AUDIO_INJECT_SCRIPT = `
 (function() {
   if (window.__sharkordAudioInjected) return;
   window.__sharkordAudioInjected = true;
+  console.log('[Sharkord] Audio injection script loaded');
+
+  let nativeLoopbackActive = false;
+
+  // Listen for the signal from main process
+  if (window.__sharkordAudio) {
+    window.__sharkordAudio.onActive((active) => {
+      nativeLoopbackActive = active;
+      console.log('[Sharkord] Native loopback active:', active);
+    });
+  }
 
   const originalGDM = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
 
   navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+    console.log('[Sharkord] getDisplayMedia intercepted, nativeLoopbackActive:', nativeLoopbackActive);
     const stream = await originalGDM(constraints);
 
-    // Check if native loopback is feeding us data
-    if (!window.__sharkordAudio) return stream;
-
-    // Wait briefly to see if we receive audio data (indicates native capture is active)
-    const hasNativeAudio = await new Promise((resolve) => {
-      let received = false;
-      const handler = () => { received = true; };
-      window.__sharkordAudio.onData(handler);
-      setTimeout(() => {
-        window.__sharkordAudio.removeData(handler);
-        resolve(received);
-      }, 200);
-    });
-
-    if (!hasNativeAudio) return stream;
-
-    // Create AudioContext and worklet to convert PCM data into a MediaStreamTrack
-    const audioCtx = new AudioContext({ sampleRate: 48000 });
-
-    // Register the processor inline via Blob URL
-    const processorCode = \`
-      class LoopbackProcessor extends AudioWorkletProcessor {
-        constructor() {
-          super();
-          this.buffer = [];
-          this.port.onmessage = (e) => {
-            // e.data = { samples: Float32Array, channels: number }
-            const { samples, channels } = e.data;
-            // Deinterleave into per-channel arrays
-            const framesPerChannel = samples.length / channels;
-            const frame = [];
-            for (let ch = 0; ch < channels; ch++) {
-              const chData = new Float32Array(framesPerChannel);
-              for (let i = 0; i < framesPerChannel; i++) {
-                chData[i] = samples[i * channels + ch];
-              }
-              frame.push(chData);
-            }
-            this.buffer.push(...frame.map((chData, ch) => ({ ch, data: chData })));
-          };
-        }
-
-        process(inputs, outputs) {
-          const output = outputs[0];
-          if (!output || output.length === 0) return true;
-
-          const numChannels = output.length;
-          const frameSize = output[0].length;
-
-          // Collect enough buffered data per channel
-          for (let ch = 0; ch < numChannels; ch++) {
-            let written = 0;
-            while (written < frameSize) {
-              // Find next buffer entry for this channel
-              const idx = this.buffer.findIndex(b => b.ch === ch);
-              if (idx === -1) {
-                // No data — fill silence
-                output[ch].fill(0, written);
-                break;
-              }
-              const entry = this.buffer[idx];
-              const available = entry.data.length;
-              const needed = frameSize - written;
-              if (available <= needed) {
-                output[ch].set(entry.data, written);
-                written += available;
-                this.buffer.splice(idx, 1);
-              } else {
-                output[ch].set(entry.data.subarray(0, needed), written);
-                entry.data = entry.data.subarray(needed);
-                written += needed;
-              }
-            }
-          }
-          return true;
-        }
-      }
-      registerProcessor('loopback-processor', LoopbackProcessor);
-    \`;
-
-    const blob = new Blob([processorCode], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
-
-    try {
-      await audioCtx.audioWorklet.addModule(url);
-    } catch (e) {
-      console.warn('[Sharkord] Failed to load AudioWorklet:', e);
-      URL.revokeObjectURL(url);
+    if (!nativeLoopbackActive || !window.__sharkordAudio) {
+      console.log('[Sharkord] No native loopback, returning original stream');
       return stream;
     }
-    URL.revokeObjectURL(url);
 
-    const workletNode = new AudioWorkletNode(audioCtx, 'loopback-processor', {
-      outputChannelCount: [2],
-    });
-    const dest = audioCtx.createMediaStreamDestination();
-    workletNode.connect(dest);
+    console.log('[Sharkord] Setting up custom audio track from native loopback');
 
-    // Feed PCM data from the native addon into the worklet
-    const dataHandler = (samples, channels, sampleRate) => {
-      workletNode.port.postMessage({
-        samples: new Float32Array(samples),
-        channels: channels,
-      });
-    };
-    window.__sharkordAudio.onData(dataHandler);
+    try {
+      // Create AudioContext matching the system sample rate
+      const audioCtx = new AudioContext({ sampleRate: 48000 });
+      await audioCtx.resume();
 
-    // Add our custom audio track to the display media stream
-    const audioTrack = dest.stream.getAudioTracks()[0];
-    stream.addTrack(audioTrack);
+      // Use ScriptProcessorNode — works everywhere, no Blob URL / CSP issues
+      const bufferSize = 4096;
+      const processor = audioCtx.createScriptProcessor(bufferSize, 1, 2);
+      const dest = audioCtx.createMediaStreamDestination();
 
-    // Clean up when screen sharing stops
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.addEventListener('ended', () => {
-        window.__sharkordAudio.removeData(dataHandler);
-        window.__sharkordAudio.stop();
-        workletNode.disconnect();
-        audioCtx.close().catch(() => {});
-      });
+      // Ring buffer for incoming PCM data (interleaved)
+      let ringBuffer = new Float32Array(0);
+      let incomingChannels = 2;
+
+      const dataHandler = (samples, channels, sampleRate) => {
+        incomingChannels = channels;
+        // Append to ring buffer
+        const newBuf = new Float32Array(ringBuffer.length + samples.length);
+        newBuf.set(ringBuffer);
+        newBuf.set(new Float32Array(samples), ringBuffer.length);
+        ringBuffer = newBuf;
+      };
+      window.__sharkordAudio.onData(dataHandler);
+
+      processor.onaudioprocess = (e) => {
+        const outL = e.outputBuffer.getChannelData(0);
+        const outR = e.outputBuffer.getChannelData(1);
+        const frameSize = outL.length;
+        const needed = frameSize * incomingChannels;
+
+        if (ringBuffer.length >= needed) {
+          // Deinterleave
+          for (let i = 0; i < frameSize; i++) {
+            outL[i] = ringBuffer[i * incomingChannels];
+            outR[i] = incomingChannels > 1 ? ringBuffer[i * incomingChannels + 1] : ringBuffer[i * incomingChannels];
+          }
+          ringBuffer = ringBuffer.subarray(needed);
+        } else {
+          // Not enough data — output silence
+          outL.fill(0);
+          outR.fill(0);
+        }
+      };
+
+      processor.connect(dest);
+
+      // Add our custom audio track to the display media stream
+      const audioTrack = dest.stream.getAudioTracks()[0];
+      if (audioTrack) {
+        stream.addTrack(audioTrack);
+        console.log('[Sharkord] Custom audio track added to stream');
+      } else {
+        console.warn('[Sharkord] No audio track from destination node');
+      }
+
+      // Clean up when screen sharing stops
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.addEventListener('ended', () => {
+          console.log('[Sharkord] Video track ended, cleaning up audio loopback');
+          window.__sharkordAudio.removeData(dataHandler);
+          window.__sharkordAudio.stop();
+          processor.disconnect();
+          audioCtx.close().catch(() => {});
+          nativeLoopbackActive = false;
+        });
+      }
+    } catch (e) {
+      console.error('[Sharkord] Failed to set up audio track:', e);
+      // Return stream without custom audio — won't have loopback at all
     }
 
     return stream;
@@ -389,9 +378,11 @@ const AUDIO_INJECT_SCRIPT = `
 })();
 `;
 
-function injectAudioWorklet() {
+function injectAudioScript() {
   if (!mainWindow) return;
-  mainWindow.webContents.executeJavaScript(AUDIO_INJECT_SCRIPT).catch(() => {});
+  mainWindow.webContents.executeJavaScript(AUDIO_INJECT_SCRIPT).catch((e) => {
+    console.warn('[Main] Failed to inject audio script:', e);
+  });
 }
 
 function navigateToSharkord(url) {
@@ -399,7 +390,7 @@ function navigateToSharkord(url) {
 
   mainWindow.webContents.on('did-finish-load', () => {
     injectDragRegion();
-    injectAudioWorklet();
+    injectAudioScript();
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url: linkUrl }) => {

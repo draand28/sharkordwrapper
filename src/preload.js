@@ -21,21 +21,32 @@ contextBridge.exposeInMainWorld('__sharkordTitlebar', {
 });
 
 // Audio loopback bridge — feeds PCM data from native addon to page context
-const audioListeners = [];
+const audioDataListeners = [];
+const audioActiveListeners = [];
 
 ipcRenderer.on('audio-loopback:data', (_, buffer, channels, sampleRate) => {
-  for (const cb of audioListeners) {
+  for (const cb of audioDataListeners) {
     cb(buffer, channels, sampleRate);
+  }
+});
+
+ipcRenderer.on('audio-loopback:active', (_, active) => {
+  console.log('[Preload] audio-loopback:active received:', active);
+  for (const cb of audioActiveListeners) {
+    cb(active);
   }
 });
 
 contextBridge.exposeInMainWorld('__sharkordAudio', {
   onData: (callback) => {
-    audioListeners.push(callback);
+    audioDataListeners.push(callback);
   },
   removeData: (callback) => {
-    const idx = audioListeners.indexOf(callback);
-    if (idx !== -1) audioListeners.splice(idx, 1);
+    const idx = audioDataListeners.indexOf(callback);
+    if (idx !== -1) audioDataListeners.splice(idx, 1);
+  },
+  onActive: (callback) => {
+    audioActiveListeners.push(callback);
   },
   stop: () => ipcRenderer.send('audio-loopback:stop'),
   isSupported: () => ipcRenderer.sendSync('audio-loopback:supported'),
