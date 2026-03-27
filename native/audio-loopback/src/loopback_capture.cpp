@@ -158,14 +158,50 @@ std::string LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback cal
         }
 
         {
-            // Get the mix format
+            // The virtual process loopback device doesn't support GetMixFormat.
+            // Get the mix format from the default render endpoint instead.
             WAVEFORMATEX* pwfx = nullptr;
             hr = m_audioClient->GetMixFormat(&pwfx);
             if (FAILED(hr)) {
-                m_audioClient->Release();
-                m_audioClient = nullptr;
-                error = "GetMixFormat failed: " + hrToString(hr);
-                goto done;
+                // Fall back: query the default render device for its mix format
+                IMMDeviceEnumerator* enumerator = nullptr;
+                hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                    __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+                if (FAILED(hr)) {
+                    m_audioClient->Release();
+                    m_audioClient = nullptr;
+                    error = "CoCreateInstance(MMDeviceEnumerator) failed: " + hrToString(hr);
+                    goto done;
+                }
+
+                IMMDevice* defaultDevice = nullptr;
+                hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice);
+                enumerator->Release();
+                if (FAILED(hr)) {
+                    m_audioClient->Release();
+                    m_audioClient = nullptr;
+                    error = "GetDefaultAudioEndpoint failed: " + hrToString(hr);
+                    goto done;
+                }
+
+                IAudioClient* tempClient = nullptr;
+                hr = defaultDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&tempClient);
+                defaultDevice->Release();
+                if (FAILED(hr)) {
+                    m_audioClient->Release();
+                    m_audioClient = nullptr;
+                    error = "Activate default device failed: " + hrToString(hr);
+                    goto done;
+                }
+
+                hr = tempClient->GetMixFormat(&pwfx);
+                tempClient->Release();
+                if (FAILED(hr)) {
+                    m_audioClient->Release();
+                    m_audioClient = nullptr;
+                    error = "GetMixFormat (default device) failed: " + hrToString(hr);
+                    goto done;
+                }
             }
 
             m_sampleRate = pwfx->nSamplesPerSec;
