@@ -1,6 +1,6 @@
 {
   "name": "sharkord",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Windows desktop wrapper for Sharkord",
   "main": "src/main.js",
   "scripts": {
