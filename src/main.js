@@ -77,10 +77,10 @@ function showScreenPicker(sources) {
       thumbnail: s.thumbnail.toDataURL(),
     }));
 
-    ipcMain.once('picker:select', (_, sourceId) => {
+    ipcMain.once('picker:select', (_, sourceId, audioEnabled) => {
       pickerWindow.close();
       const selected = sources.find(s => s.id === sourceId);
-      resolve(selected || null);
+      resolve(selected ? { source: selected, audio: audioEnabled } : null);
     });
 
     ipcMain.once('picker:cancel', () => {
@@ -134,9 +134,11 @@ function setupPermissions() {
         callback({});
         return;
       }
-      showScreenPicker(sources).then((selected) => {
-        if (selected) {
-          callback({ video: selected, audio: 'loopbackWithMute' });
+      showScreenPicker(sources).then((result) => {
+        if (result) {
+          const opts = { video: result.source };
+          if (result.audio) opts.audio = 'loopback';
+          callback(opts);
         } else {
           callback({});
         }

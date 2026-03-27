@@ -119,6 +119,29 @@
     .grid::-webkit-scrollbar { width: 6px; }
     .grid::-webkit-scrollbar-track { background: transparent; }
     .grid::-webkit-scrollbar-thumb { background: #333355; border-radius: 3px; }
+
+    .footer {
+      padding: 12px 20px;
+      border-top: 1px solid #333355;
+      flex-shrink: 0;
+    }
+
+    .audio-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #ccccdd;
+      user-select: none;
+    }
+
+    .audio-toggle input[type="checkbox"] {
+      accent-color: #5865f2;
+      width: 16px;
+      height: 16px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -134,6 +157,13 @@
   </div>
 
   <div class="grid" id="grid"></div>
+
+  <div class="footer">
+    <label class="audio-toggle">
+      <input type="checkbox" id="share-audio">
+      Share system audio
+    </label>
+  </div>
 
   <script>
     const grid = document.getElementById('grid');
@@ -172,7 +202,7 @@
           <div class="name" title="${source.name}">${source.name}</div>
         `;
         div.addEventListener('click', () => {
-          window.picker.select(source.id);
+          window.picker.select(source.id, document.getElementById('share-audio').checked);
         });
         grid.appendChild(div);
       });
