@@ -2,6 +2,8 @@
 #include <avrt.h>
 #include <combaseapi.h>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 
 #ifndef E_TIMEOUT
 #define E_TIMEOUT HRESULT_FROM_WIN32(ERROR_TIMEOUT)
@@ -92,102 +94,139 @@ std::string LoopbackCapture::Start(DWORD excludeProcessId, AudioDataCallback cal
 
     m_callback = callback;
 
-    // Don't call CoInitializeEx here — Electron's main thread already has COM.
-    // The capture thread will init COM for itself.
+    // ActivateAudioInterfaceAsync requires MTA COM apartment.
+    // Electron's main thread is STA, so we must do activation on a worker thread.
+    std::string initError;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool initDone = false;
 
-    // Set up process loopback activation params
-    AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
-    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = excludeProcessId;
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode =
-        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+    std::thread initThread([&]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-    PROPVARIANT activateParams = {};
-    activateParams.vt = VT_BLOB;
-    activateParams.blob.cbSize = sizeof(activationParams);
-    activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
+        std::string error;
 
-    auto* handler = new ActivationHandler();
-    IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
+        // Set up process loopback activation params
+        AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
+        activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+        activationParams.ProcessLoopbackParams.TargetProcessId = excludeProcessId;
+        activationParams.ProcessLoopbackParams.ProcessLoopbackMode =
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
 
-    HRESULT hr = ActivateAudioInterfaceAsync(
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-        __uuidof(IAudioClient),
-        &activateParams,
-        handler,
-        &asyncOp
-    );
+        PROPVARIANT activateParams = {};
+        activateParams.vt = VT_BLOB;
+        activateParams.blob.cbSize = sizeof(activationParams);
+        activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
 
-    if (FAILED(hr)) {
-        handler->Release();
-        return "ActivateAudioInterfaceAsync failed: " + hrToString(hr);
-    }
+        auto* handler = new ActivationHandler();
+        IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
 
-    hr = handler->Wait(5000);
-    if (FAILED(hr)) {
+        HRESULT hr = ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            __uuidof(IAudioClient),
+            &activateParams,
+            handler,
+            &asyncOp
+        );
+
+        if (FAILED(hr)) {
+            handler->Release();
+            error = "ActivateAudioInterfaceAsync failed: " + hrToString(hr);
+            goto done;
+        }
+
+        hr = handler->Wait(5000);
+        if (FAILED(hr)) {
+            handler->Release();
+            if (asyncOp) asyncOp->Release();
+            error = "Activation wait failed: " + hrToString(hr);
+            goto done;
+        }
+
+        hr = handler->GetResult(&m_audioClient);
         handler->Release();
         if (asyncOp) asyncOp->Release();
-        return "Activation wait failed: " + hrToString(hr);
+
+        if (FAILED(hr) || !m_audioClient) {
+            error = "GetResult failed: " + hrToString(hr) + (m_audioClient ? "" : " (null client)");
+            goto done;
+        }
+
+        {
+            // Get the mix format
+            WAVEFORMATEX* pwfx = nullptr;
+            hr = m_audioClient->GetMixFormat(&pwfx);
+            if (FAILED(hr)) {
+                m_audioClient->Release();
+                m_audioClient = nullptr;
+                error = "GetMixFormat failed: " + hrToString(hr);
+                goto done;
+            }
+
+            m_sampleRate = pwfx->nSamplesPerSec;
+            m_channels = pwfx->nChannels;
+
+            // Initialize audio client: 20ms buffer, shared mode
+            REFERENCE_TIME bufferDuration = 200000; // 20ms in 100ns units
+            hr = m_audioClient->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                bufferDuration,
+                0,
+                pwfx,
+                nullptr
+            );
+            CoTaskMemFree(pwfx);
+
+            if (FAILED(hr)) {
+                m_audioClient->Release();
+                m_audioClient = nullptr;
+                error = "Initialize failed: " + hrToString(hr);
+                goto done;
+            }
+        }
+
+        hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_captureClient);
+        if (FAILED(hr)) {
+            m_audioClient->Release();
+            m_audioClient = nullptr;
+            error = "GetService(CaptureClient) failed: " + hrToString(hr);
+            goto done;
+        }
+
+        hr = m_audioClient->Start();
+        if (FAILED(hr)) {
+            m_captureClient->Release();
+            m_captureClient = nullptr;
+            m_audioClient->Release();
+            m_audioClient = nullptr;
+            error = "AudioClient Start failed: " + hrToString(hr);
+            goto done;
+        }
+
+    done:
+        CoUninitialize();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            initError = error;
+            initDone = true;
+        }
+        cv.notify_one();
+    });
+
+    // Wait for the init thread to finish
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]{ return initDone; });
     }
+    initThread.join();
 
-    hr = handler->GetResult(&m_audioClient);
-    handler->Release();
-    if (asyncOp) asyncOp->Release();
-
-    if (FAILED(hr) || !m_audioClient) {
-        return "GetResult failed: " + hrToString(hr) + (m_audioClient ? "" : " (null client)");
-    }
-
-    // Get the mix format
-    WAVEFORMATEX* pwfx = nullptr;
-    hr = m_audioClient->GetMixFormat(&pwfx);
-    if (FAILED(hr)) {
-        m_audioClient->Release();
-        m_audioClient = nullptr;
-        return "GetMixFormat failed: " + hrToString(hr);
-    }
-
-    m_sampleRate = pwfx->nSamplesPerSec;
-    m_channels = pwfx->nChannels;
-
-    // Initialize audio client: 20ms buffer, shared mode
-    REFERENCE_TIME bufferDuration = 200000; // 20ms in 100ns units
-    hr = m_audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-        bufferDuration,
-        0,
-        pwfx,
-        nullptr
-    );
-    CoTaskMemFree(pwfx);
-
-    if (FAILED(hr)) {
-        m_audioClient->Release();
-        m_audioClient = nullptr;
-        return "Initialize failed: " + hrToString(hr);
-    }
-
-    hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_captureClient);
-    if (FAILED(hr)) {
-        m_audioClient->Release();
-        m_audioClient = nullptr;
-        return "GetService(CaptureClient) failed: " + hrToString(hr);
+    if (!initError.empty()) {
+        return initError;
     }
 
     ResetEvent(m_stopEvent);
     m_capturing = true;
-
-    hr = m_audioClient->Start();
-    if (FAILED(hr)) {
-        m_captureClient->Release();
-        m_captureClient = nullptr;
-        m_audioClient->Release();
-        m_audioClient = nullptr;
-        m_capturing = false;
-        return "AudioClient Start failed: " + hrToString(hr);
-    }
-
     m_thread = std::thread(&LoopbackCapture::CaptureThread, this);
     return ""; // success
 }
